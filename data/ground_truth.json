@@ -1,0 +1,18 @@
+{
+  "normal_traffic.pcap": {
+    "has_deauth_attack": false,
+    "has_evil_twin": false
+  },
+  "attack_sample.pcap": {
+    "has_deauth_attack": true,
+    "has_evil_twin": true
+  },
+  "real_deauth_sample.pcap": {
+    "has_deauth_attack": false,
+    "has_evil_twin": false
+  },
+  "real_normal_sample.pcap": {
+    "has_deauth_attack": false,
+    "has_evil_twin": false
+  }
+}

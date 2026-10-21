@@ -1,69 +1,94 @@
 # src/detectors/deauth_detector.py
-from scapy.all import rdpcap, Dot11Deauth
+from scapy.all import rdpcap, Dot11Deauth, Dot11Disas
 import pandas as pd
 
-def detect_deauth_attacks(pcap_path, threshold=10):
+def detect_deauth_attacks(pcap_path, burst_threshold=3, window_seconds=5):
     """
-    Analyse un fichier PCAP pour détecter les rafales de trames Deauth.
-    
-    :param pcap_path: Chemin du fichier .pcap à analyser
-    :param threshold: Nombre minimal de trames Deauth pour déclarer une alerte
-    :return: DataFrame Pandas contenant le résumé des alertes
+    Analyse comportementale des attaques Deauth / Disassociation
+    utilisant des fenêtres glissantes temporelles avec Pandas.
     """
     print(f"[*] Analyse de : {pcap_path}")
-    packets = rdpcap(pcap_path)
+    try:
+        packets = rdpcap(pcap_path)
+    except Exception as e:
+        print(f"[!] Erreur de lecture du fichier : {e}")
+        return pd.DataFrame()
     
     deauth_events = []
 
     for pkt in packets:
-        # Vérifie si le paquet contient une couche de désauthentification 802.11
-        if pkt.haslayer(Dot11Deauth):
-            dot11 = pkt.getlayer(Dot11Deauth)
+        # Ingestion des trames Deauth (subtype 12) et Disassoc (subtype 10)
+        if pkt.haslayer(Dot11Deauth) or pkt.haslayer(Dot11Disas):
+            layer_type = "Deauth" if pkt.haslayer(Dot11Deauth) else "Disassoc"
             
-            # Extraction des adresses MAC
-            # addr1 = Cible (Destination)
-            # addr2 = Source (AP ou Attaquant usurpateur)
-            # addr3 = BSSID (Identifiant du réseau Wi-Fi)
-            target_mac = pkt.addr1 if hasattr(pkt, 'addr1') else "Unknown"
-            source_mac = pkt.addr2 if hasattr(pkt, 'addr2') else "Unknown"
-            bssid = pkt.addr3 if hasattr(pkt, 'addr3') else "Unknown"
-            reason_code = dot11.reason
+            target_mac = pkt.addr1 if hasattr(pkt, 'addr1') and pkt.addr1 else "ff:ff:ff:ff:ff:ff"
+            source_mac = pkt.addr2 if hasattr(pkt, 'addr2') and pkt.addr2 else "Unknown"
+            bssid = pkt.addr3 if hasattr(pkt, 'addr3') and pkt.addr3 else "Unknown"
+            
+            reason_code = None
+            if pkt.haslayer(Dot11Deauth):
+                reason_code = pkt.getlayer(Dot11Deauth).reason
+            elif pkt.haslayer(Dot11Disas):
+                reason_code = pkt.getlayer(Dot11Disas).reason
 
             deauth_events.append({
                 "source_mac": source_mac,
                 "target_mac": target_mac,
                 "bssid": bssid,
+                "type": layer_type,
                 "reason_code": reason_code,
-                "timestamp": float(pkt.time)
+                "timestamp": pd.to_datetime(float(pkt.time), unit='s')
             })
 
     if not deauth_events:
-        print("[+] Aucune trame de désauthentification trouvée.")
+        print("[+] Aucune trame de désauthentification/désassociation trouvée.")
         return pd.DataFrame()
 
     df = pd.DataFrame(deauth_events)
-    
-    # Agrégation par paire Source -> Cible
-    summary = df.groupby(["source_mac", "target_mac", "bssid"]).size().reset_index(name="deauth_count")
-    
-    # Filtrage selon le seuil d'alerte
-    alerts = summary[summary["deauth_count"] >= threshold].copy()
-    alerts["severity"] = alerts["deauth_count"].apply(
-        lambda count: "CRITICAL" if count >= 50 else ("HIGH" if count >= 20 else "WARNING")
-    )
+    df = df.sort_values("timestamp")
 
-    return alerts
+    alerts = []
+    
+    # Groupement par couple (Source, BSSID)
+    grouped = df.groupby(["source_mac", "bssid"])
+
+    for (source_mac, bssid), group in grouped:
+        group_indexed = group.set_index("timestamp")
+        
+        # Calcul du nombre de trames dans chaque fenêtre glissante (ex: 5s)
+        rolling_count = group_indexed["type"].rolling(f"{window_seconds}s").count()
+        max_burst = int(rolling_count.max())
+        total_count = len(group)
+
+        # Condition d'alerte : Rafale dense dans la fenêtre OU total élevé
+        if max_burst >= burst_threshold or total_count >= 5:
+            if max_burst >= 20:
+                severity = "CRITICAL"
+            elif max_burst >= 10:
+                severity = "HIGH"
+            else:
+                severity = "WARNING"
+
+            alerts.append({
+                "source_mac": source_mac,
+                "bssid": bssid,
+                "deauth_count": total_count,
+                "max_burst_5s": max_burst,
+                "severity": severity
+            })
+
+    if not alerts:
+        print("[+] Trafic sous le seuil d'alerte.")
+        return pd.DataFrame()
+
+    return pd.DataFrame(alerts)
 
 if __name__ == "__main__":
     import sys
-    
-    # Fichier à tester (par défaut le fichier d'attaque)
-    target_pcap = sys.argv[1] if len(sys.argv) > 1 else "data/raw/attack_sample.pcap"
-    
-    results = detect_deauth_attacks(target_pcap)
-    
-    if not results.empty:
+    target = sys.argv[1] if len(sys.argv) > 1 else "data/raw/attack_sample.pcap"
+    res = detect_deauth_attacks(target)
+    if not res.empty:
         print("\n[!] ALERTE : Attaque(s) Deauth détectée(s) !")
-        print(results.to_string(index=False))
+        print(res.to_string(index=False))
     else:
-        print("\n[+] Trafic sain ou sous le seuil d'alerte.")
+        print("\n[+] Aucun événement suspect.")
