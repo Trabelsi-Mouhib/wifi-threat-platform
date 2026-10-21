@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# Streamlit
+.streamlit/
+
+# Captures et rapports temporaires
+data/processed/*
+reports/*
+!data/raw/normal_traffic.pcap
+!data/raw/attack_sample.pcap
