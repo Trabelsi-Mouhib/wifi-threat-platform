@@ -5,40 +5,41 @@ from src.detectors.evil_twin_detector import detect_evil_twins
 
 def analyze_pcap(pcap_path):
     """
-    Analyse un fichier PCAP à l'aide des modules Deauth et Evil Twin,
-    puis calcule un score de risque global.
+    Analyse globale d'un fichier PCAP avec agrégation des alertes,
+    vérification des constructeurs MAC et calcul du score de risque.
     """
-    deauth_alerts = detect_deauth_attacks(pcap_path, threshold=10)
+    deauth_alerts = detect_deauth_attacks(pcap_path, burst_threshold=3, window_seconds=5)
     evil_twin_alerts = detect_evil_twins(pcap_path)
 
-    # Calcul du score de risque global (sur 100)
     risk_score = 0
     threat_summary = []
 
-    has_deauth = not deauth_alerts.empty
-    has_evil_twin = not evil_twin_alerts.empty
-
-    if has_deauth:
-        max_deauths = deauth_alerts["deauth_count"].max()
-        if max_deauths >= 50:
-            risk_score += 45
+    # 1. Traitement des alertes Deauth
+    if not deauth_alerts.empty:
+        max_burst = deauth_alerts["max_burst_5s"].max()
+        if max_burst >= 20:
+            risk_score += 50
+        elif max_burst >= 10:
+            risk_score += 35
         else:
-            risk_score += 25
-        threat_summary.append("Attaque par désauthentification détectée")
+            risk_score += 20
+        threat_summary.append(f"Rafale Deauth/Disassoc (max {max_burst} trames/5s)")
 
-    if has_evil_twin:
-        risk_score += 45
-        threat_summary.append("Point d'accès malveillant (Evil Twin) détecté")
+    # 2. Traitement des alertes Evil Twin avec vérification OUI Vendor
+    if not evil_twin_alerts.empty:
+        max_suspicion = evil_twin_alerts["suspicion_score"].max()
+        risk_score += max_suspicion / 2  # Poids ajusté selon le niveau de certitude OUI
 
-    # Corrélation des menaces (Deauth + Evil Twin en même temps = attaque ciblée active)
-    if has_deauth and has_evil_twin:
-        risk_score += 10  # Bonus de risque pour corrélation
-        threat_summary.append("COMBINAISON CRITIQUE : Deauth + Evil Twin")
+        vendors_involved = evil_twin_alerts["vendors"].tolist()
+        threat_summary.append(f"Evil Twin / Rogue AP suspecté (Constructeurs: {', '.join(vendors_involved)})")
 
-    # Plafonner le score à 100
-    risk_score = min(risk_score, 100)
+    # Corrélation critique (Attaque Deauth + Evil Twin simultanés)
+    if not deauth_alerts.empty and not evil_twin_alerts.empty:
+        risk_score += 15
+        threat_summary.append("COMBINAISON CRITIQUE : Deauth Flood + Evil Twin")
 
-    # Qualification du niveau de menace
+    risk_score = min(int(risk_score), 100)
+
     if risk_score >= 75:
         threat_level = "CRITIQUE"
     elif risk_score >= 45:

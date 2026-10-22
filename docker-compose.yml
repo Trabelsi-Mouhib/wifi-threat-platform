@@ -1,0 +1,10 @@
+services:
+  wifi-threat-platform:
+    build: .
+    container_name: wifi_threat_platform
+    ports:
+      - "8501:8501"
+    volumes:
+      # Montage du dossier data/raw pour ajouter/supprimer des PCAPs sans recompiler l'image
+      - ./data/raw:/app/data/raw
+    restart: unless-stopped

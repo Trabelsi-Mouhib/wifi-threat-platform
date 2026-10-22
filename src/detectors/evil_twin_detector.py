@@ -1,85 +1,106 @@
 # src/detectors/evil_twin_detector.py
 from scapy.all import rdpcap, Dot11Beacon, Dot11Elt
 import pandas as pd
+from mac_vendor_lookup import MacLookup
 
-def extract_beacon_info(pcap_path):
-    """Parcourt le PCAP et extrait les informations des trames Beacon."""
-    packets = rdpcap(pcap_path)
-    ap_list = []
+# Initialisation du résolveur MAC OUI
+lookup = MacLookup()
 
-    for pkt in packets:
-        # Vérifie si le paquet est une trame de gestion Beacon
-        if pkt.haslayer(Dot11Beacon):
-            bssid = pkt.addr3 if hasattr(pkt, 'addr3') else "Unknown"
-            ssid = "Hidden SSID"
-            channel = None
-
-            # Parcours des éléments d'information (IE) de la trame 802.11
-            elt = pkt.getlayer(Dot11Elt)
-            while isinstance(elt, Dot11Elt):
-                # ID 0 = SSID
-                if elt.ID == 0 and elt.info:
-                    try:
-                        ssid = elt.info.decode("utf-8", errors="ignore")
-                    except Exception:
-                        ssid = str(elt.info)
-                # ID 3 = DS Parameter Set (Canal radio)
-                elif elt.ID == 3 and len(elt.info) == 1:
-                    channel = ord(elt.info)
-                
-                elt = elt.payload.getlayer(Dot11Elt)
-
-            if ssid and ssid != "Hidden SSID":
-                ap_list.append({
-                    "ssid": ssid,
-                    "bssid": bssid,
-                    "channel": channel,
-                    "timestamp": float(pkt.time)
-                })
-
-    return pd.DataFrame(ap_list)
+def get_vendor(mac_address):
+    """Résout le constructeur à partir du préfixe MAC (OUI IEEE)."""
+    try:
+        return lookup.lookup(mac_address)
+    except Exception:
+        return "Inconnu / Non enregistré"
 
 def detect_evil_twins(pcap_path):
     """
-    Analyse les réseaux Wi-Fi pour identifier les doublons de SSID
-    associés à des BSSID différents.
+    Détection multi-critères d'Evil Twin / Rogue AP basée sur :
+    - La duplication de SSID sur différents BSSIDs
+    - La divergence de constructeur (OUI Vendor)
     """
     print(f"[*] Analyse Evil Twin de : {pcap_path}")
-    df = extract_beacon_info(pcap_path)
+    try:
+        packets = rdpcap(pcap_path)
+    except Exception as e:
+        print(f"[!] Erreur de lecture du fichier : {e}")
+        return pd.DataFrame()
 
-    if df.empty:
+    aps = {}
+
+    for pkt in packets:
+        if pkt.haslayer(Dot11Beacon):
+            bssid = pkt.addr3 if hasattr(pkt, 'addr3') and pkt.addr3 else "Unknown"
+            
+            # Extraire le SSID depuis la trame Beacon
+            elt = pkt.getlayer(Dot11Elt)
+            ssid = None
+            while isinstance(elt, Dot11Elt):
+                if elt.ID == 0:  # ID 0 = SSID
+                    try:
+                        ssid = elt.info.decode('utf-8', errors='ignore')
+                    except Exception:
+                        ssid = str(elt.info)
+                    break
+                elt = elt.payload
+
+            if bssid and ssid and bssid not in aps:
+                vendor = get_vendor(bssid)
+                aps[bssid] = {
+                    "bssid": bssid,
+                    "ssid": ssid,
+                    "vendor": vendor
+                }
+
+    if not aps:
         print("[+] Aucune trame Beacon trouvée.")
         return pd.DataFrame()
 
-    # Dédoublonnage des paires (SSID, BSSID)
-    unique_aps = df.groupby(["ssid", "bssid"]).agg(
-        first_seen=("timestamp", "min"),
-        last_seen=("timestamp", "max"),
-        beacon_count=("timestamp", "count")
-    ).reset_index()
+    df_aps = pd.DataFrame(list(aps.values()))
+    
+    # Filtrer les SSID masqués ou vides
+    df_aps = df_aps[df_aps['ssid'].str.strip() != ""]
 
-    # Recherche des SSID qui ont plus d'un BSSID associe
-    ssid_counts = unique_aps.groupby("ssid")["bssid"].nunique().reset_index(name="bssid_count")
-    suspicious_ssids = ssid_counts[ssid_counts["bssid_count"] > 1]["ssid"]
+    alerts = []
 
-    if suspicious_ssids.empty:
-        print("[+] Aucun doublon de SSID détecté.")
+    # Regroupement par SSID
+    grouped = df_aps.groupby("ssid")
+
+    for ssid, group in grouped:
+        # S'il y a au moins 2 BSSID différents pour un même SSID
+        if len(group) > 1:
+            vendors = group["vendor"].unique()
+            bssids = group["bssid"].tolist()
+
+            # Indice de suspicion : Si les constructeurs sont différents, c'est très probablement un Evil Twin
+            if len(vendors) > 1:
+                threat_level = "CRITIQUE (Constructeurs MAC divergents)"
+                suspicion_score = 90
+            else:
+                threat_level = "SUSPECT (Possible Roaming Légitime ou Evil Twin Clané)"
+                suspicion_score = 45
+
+            alerts.append({
+                "ssid": ssid,
+                "bssid_count": len(group),
+                "bssids": ", ".join(bssids),
+                "vendors": ", ".join(vendors),
+                "threat_level": threat_level,
+                "suspicion_score": suspicion_score
+            })
+
+    if not alerts:
+        print("[+] Aucun doublon de SSID suspect détecté.")
         return pd.DataFrame()
 
-    # Extraction des alertes
-    alerts = unique_aps[unique_aps["ssid"].isin(suspicious_ssids)].copy()
-    alerts["severity"] = "HIGH"
-
-    return alerts
+    return pd.DataFrame(alerts)
 
 if __name__ == "__main__":
     import sys
-    
-    target_pcap = sys.argv[1] if len(sys.argv) > 1 else "data/raw/attack_sample.pcap"
-    alerts = detect_evil_twins(target_pcap)
-
-    if not alerts.empty:
-        print("\n[!] ALERTE : Point(s) d'accès Evil Twin / Rogue AP détecté(s) !")
-        print(alerts.to_string(index=False))
+    target = sys.argv[1] if len(sys.argv) > 1 else "data/raw/attack_sample.pcap"
+    res = detect_evil_twins(target)
+    if not res.empty:
+        print("\n[!] ALERTE : Evil Twin détecté !")
+        print(res.to_string(index=False))
     else:
-        print("\n[+] Aucun point d'accès suspect détecté.")
+        print("\n[+] Aucun Evil Twin détecté.")
